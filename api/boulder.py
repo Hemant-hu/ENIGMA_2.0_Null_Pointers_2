@@ -2,58 +2,100 @@ from ultralytics import YOLO
 import os
 import cv2
 import cvzone
+import csv
 from datetime import datetime
 
-# Load YOLO model
+from geo.load_geometry import get_lat_lon
+from geo.depth_estimator import pixel_to_meters, estimate_depth
+from utils.tiling import split_image
+
 model = YOLO("weights/best.pt")
 
-def predict_boulder(image_path: str):
-    """Predict boulders and save annotated image (supports png, jpg, jpeg)."""
 
-    print("Loading image from:", image_path)
-    print("File exists:", os.path.exists(image_path))
+def predict_boulder(image_path: str):
 
     image = cv2.imread(image_path)
-
     if image is None:
-        print("❌ Error: Unsupported format or invalid path.")
+        print("Invalid path")
         return
 
-    results = model.predict(image)
+    # 🔥 Split very large image into tiles
+    tiles = split_image(image, tile_size=1024, overlap=200)
 
     os.makedirs("results/boulders", exist_ok=True)
 
-    for r in results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            conf = float(box.conf[0])
+    # New CSV file for measurements
+    csv_path = "results/boulders/terrain_measurements.csv"
+    csv_file = open(csv_path, mode='w', newline='')
+    writer = csv.writer(csv_file)
+    writer.writerow(["Latitude", "Longitude", "Diameter(m)", "Depth(m)", "Confidence"])
 
-            width = x2 - x1
-            height = y2 - y1
-            diameter = width * 0.3
+    # Loop over each tile
+    for tile, offset_x, offset_y in tiles:
 
-            # 🔥 THINNER BOX (main change)
-            cvzone.cornerRect(
-                image,
-                (x1, y1, width, height),
-                l=8,      # shorter corner lines
-                t=1,      # thin corners
-                rt=1      # thin rectangle border
-            )
+        results = model.predict(tile, verbose=False)
 
-    _, ext = os.path.splitext(image_path)
-    ext = ext.lower()
-    allowed_formats = [".png", ".jpg", ".jpeg"]
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                conf = float(box.conf[0])
 
-    if ext not in allowed_formats:
-        print("⚠ Unsupported format. Saving as .jpg instead.")
-        ext = ".jpg"
+                # Convert tile coords → original full image coords
+                x1 += offset_x
+                x2 += offset_x
+                y1 += offset_y
+                y2 += offset_y
+
+                width_px = x2 - x1
+                height_px = y2 - y1
+
+                # Convert to real-world units
+                diameter_m = pixel_to_meters(width_px)
+                depth_m = estimate_depth(height_px * 0.5)
+
+                # Center pixel for geo mapping
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+
+                lat, lon = get_lat_lon(cx, cy)
+
+                # Save to CSV
+                writer.writerow([lat, lon, diameter_m, depth_m, conf])
+
+                # Draw bounding box on original image
+                cvzone.cornerRect(image, (x1, y1, width_px, height_px), l=8, t=1, rt=1)
+
+                # Text lines
+                text1 = f"Lat:{lat:.4f} Lon:{lon:.4f}"
+                text2 = f"D:{diameter_m:.2f}m Depth:{depth_m:.2f}m"
+
+                # Draw text above box
+                cvzone.putTextRect(
+                    image,
+                    text1,
+                    (x1, max(30, y1 - 40)),
+                    scale=0.7,
+                    thickness=1
+                )
+
+                cvzone.putTextRect(
+                    image,
+                    text2,
+                    (x1, max(60, y1 - 10)),
+                    scale=0.7,
+                    thickness=1
+                )
+
+    csv_file.close()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = f"results/boulders/boulder_{timestamp}{ext}"
+    save_path = f"results/boulders/terrain_{timestamp}.jpg"
     cv2.imwrite(save_path, image)
 
-    print(f"✅ Saved: {save_path}")
+    print("CSV Saved:", csv_path)
+    print("Image Saved:", save_path)
 
 
-predict_boulder(r"E:\ENIGMA_2.0_Null_Pointers_2\api\results\inputs\OIP.jpg")
+# Run test
+predict_boulder(r"results/inputs/ch2_ohr_ncp_20251109T1504259907_b_brw_d18.png")
+
